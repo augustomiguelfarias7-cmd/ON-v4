@@ -106,4 +106,5 @@ Ferramentas de análise e resumo de grandes volumes de dados multimodais.
 
 Plataformas de educação, pesquisa e robótica com percepção multimodal.
 
-
+# o que que aconteceu com a GPT-Mini?
+nada mais o GPT-Mini 8 vai lançar amanhã 
