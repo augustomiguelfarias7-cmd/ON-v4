@@ -1,0 +1,679 @@
+# train_on_full.py
+import os
+import math
+import random
+import argparse
+from typing import List, Iterator, Optional, Tuple, Dict
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from tokenizers import Tokenizer, models, pre_tokenizers, trainers, normalizers
+from datasets import load_dataset
+
+from PIL import Image
+from torchvision import transforms
+import torchaudio
+
+try:
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+    PLAYWRIGHT_AVAILABLE = True
+except Exception:
+    PLAYWRIGHT_AVAILABLE = False
+
+DEFAULT_VOCAB_SIZE = 200000
+DEFAULT_MAX_SEQ = 200_000
+DEFAULT_EMBED = 1024
+DEFAULT_LAYERS = 12
+DEFAULT_HEADS = 16
+DEFAULT_BATCH = 2
+CHECKPOINT_DIR = "checkpoints_on"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+DATASET_IDS_TEXT = [
+    "wikipedia",
+    "openwebtext",
+    "bookcorpus",
+    "pile",
+    "cc_news",
+    "wikitext",
+    "arxiv",
+    "pubmed",
+    "europarl",
+    "open_subtitles",
+]
+
+DATASET_IDS_IMAGE = [
+    "coco",
+    "openimages",
+    "image_corpus_placeholder"
+]
+
+DATASET_IDS_AUDIO = [
+    "mozilla-foundation/common_voice",
+    "librispeech_asr",
+    "voxpopuli",
+    "speech_commands"
+]
+
+DATASET_IDS_CODE = [
+    "bigcode/the-stack",        # grande; exige recursos
+    "codeparrot/github-code",   # se disponível
+    "huggingface-course/codeparrot",  # fallback examples
+    "neulab/code-search-net"    # outras coleções
+]
+
+SPECIAL_TOKENS = ["[PAD]","[UNK]","[CLS]","[SEP]","<JSON_START>","<JSON_END>","<STRUCT>","<CODE_START>","<CODE_END>"]
+
+class ONTokenizerWrapper:
+    def __init__(self, vocab_size:int=DEFAULT_VOCAB_SIZE, path_out: str = "on_tokenizer.json"):
+        self.vocab_size = vocab_size
+        self.path_out = path_out
+        self.tokenizer = Tokenizer(models.BPE())
+        self.tokenizer.normalizer = normalizers.NFKC()
+        self.tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+        self.trainer = trainers.BpeTrainer(vocab_size=self.vocab_size, special_tokens=SPECIAL_TOKENS)
+        self._is_trained = False
+
+    def train_from_iterator(self, iterator: Iterator[str]):
+        print("[Tokenizer] Treinando BPE...")
+        self.tokenizer.train_from_iterator(iterator, trainer=self.trainer)
+        self.tokenizer.save(self.path_out)
+        self._is_trained = True
+        print(f"[Tokenizer] salvo em {self.path_out}")
+
+    def load(self):
+        if os.path.exists(self.path_out):
+            self.tokenizer = Tokenizer.from_file(self.path_out)
+            self._is_trained = True
+            print("[Tokenizer] carregado")
+        else:
+            raise FileNotFoundError("Tokenizer não encontrado")
+
+    def encode_ids(self, text: str, max_length: int = DEFAULT_MAX_SEQ) -> List[int]:
+        ids = self.tokenizer.encode(text).ids
+        return ids[:max_length] if len(ids) > max_length else ids
+
+    def pad_truncate(self, ids: List[int], max_length: int = DEFAULT_MAX_SEQ) -> List[int]:
+        if len(ids) >= max_length:
+            return ids[:max_length]
+        pad_id = self.tokenizer.token_to_id("[PAD]") if "[PAD]" in self.tokenizer.get_vocab() else 0
+        return ids + [pad_id] * (max_length - len(ids))
+
+    def get_vocab_size(self):
+        return len(self.tokenizer.get_vocab())
+
+def text_stream_iterator(hf_id:str, config_name: Optional[str]=None, field_candidates: List[str]=["text","article","content"]):
+    try:
+        if config_name:
+            ds = load_dataset(hf_id, config_name, split="train", streaming=True)
+        else:
+            ds = load_dataset(hf_id, split="train", streaming=True)
+    except Exception as e:
+        print(f"[Dataset] erro abrir {hf_id}: {e}")
+        return iter([])
+    def gen():
+        for ex in ds:
+            if isinstance(ex, dict):
+                for k in field_candidates:
+                    if k in ex and isinstance(ex[k], str):
+                        yield ex[k]; break
+            elif isinstance(ex, str):
+                yield ex
+    return gen()
+
+def code_dataset_iterator(hf_id:str):
+    try:
+        ds = load_dataset(hf_id, split="train")
+    except Exception as e:
+        print(f"[CodeDataset] não foi possível abrir {hf_id}: {e}")
+        return iter([])
+    def gen():
+        for ex in ds:
+            if isinstance(ex, dict):
+                # vários schemas: try common fields
+                code = ex.get("content") or ex.get("text") or ex.get("code") or ex.get("source") or ex.get("file")
+                if isinstance(code, str) and len(code.strip())>0:
+                    yield code
+            elif isinstance(ex, str):
+                yield ex
+    return gen()
+
+def image_dataset_iterator(hf_id:str):
+    try:
+        ds = load_dataset(hf_id, split="train")
+    except Exception as e:
+        print(f"[Image] erro {hf_id}: {e}")
+        return iter([])
+    def gen():
+        for ex in ds:
+            img = None
+            if isinstance(ex, dict):
+                if "image" in ex: img = ex["image"]
+                elif "img" in ex: img = ex["img"]
+                caption = ex.get("caption","")
+            else:
+                caption = ""
+            if img is not None:
+                yield img, caption
+    return gen()
+
+def audio_dataset_iterator(hf_id:str, config_name:Optional[str]=None):
+    try:
+        if config_name:
+            ds = load_dataset(hf_id, config_name, split="train", streaming=True)
+        else:
+            ds = load_dataset(hf_id, split="train", streaming=True)
+    except Exception as e:
+        print(f"[Audio] erro {hf_id}: {e}")
+        return iter([])
+    def gen():
+        for ex in ds:
+            if isinstance(ex, dict) and "audio" in ex:
+                yield ex["audio"], ex.get("sentence", "") or ex.get("text", "")
+    return gen()
+
+class VisionEncoder(nn.Module):
+    def __init__(self, embed_dim:int):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(3, 32, 3, 2, 1), nn.ReLU(),
+            nn.Conv2d(32, 64, 3, 2, 1), nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1,1)),
+            nn.Flatten()
+        )
+        self.fc = nn.Linear(64, embed_dim)
+    def forward(self, img_tensor):
+        feat = self.conv(img_tensor)
+        return self.fc(feat)
+
+class ChunkAudioEncoder(nn.Module):
+    def __init__(self, embed_dim:int, sample_rate:int=16000, n_mels:int=80, chunk_seconds:float=30.0):
+        super().__init__()
+        self.sample_rate = sample_rate
+        self.n_mels = n_mels
+        self.chunk_samples = int(chunk_seconds * sample_rate)
+        self.melspec = torchaudio.transforms.MelSpectrogram(sample_rate=sample_rate, n_mels=n_mels)
+        self.chunk_cnn = nn.Sequential(
+            nn.Conv1d(n_mels, 128, 3, 2, 1), nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1), nn.Flatten()
+        )
+        self.fc = nn.Linear(128, embed_dim)
+        self.agg_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=4, dim_feedforward=embed_dim*2)
+    def forward(self, wave: torch.Tensor):
+        device = wave.device
+        B, T = wave.shape
+        chunk_embs = []
+        for start in range(0, T, self.chunk_samples):
+            seg = wave[:, start:start+self.chunk_samples]
+            if seg.shape[1] == 0: break
+            if seg.shape[1] < self.chunk_samples:
+                pad = torch.zeros(B, self.chunk_samples - seg.shape[1], device=device)
+                seg = torch.cat([seg, pad], dim=1)
+            mel = self.melspec(seg)
+            emb = self.chunk_cnn(mel)
+            emb = self.fc(emb)
+            chunk_embs.append(emb.unsqueeze(0))
+        if len(chunk_embs) == 0:
+            return torch.zeros(B, self.fc.out_features, device=device)
+        seq = torch.cat(chunk_embs, dim=0)
+        seq = self.agg_layer(seq)
+        pooled = seq.mean(dim=0)
+        return pooled
+
+class MultiHeadSelfAttention(nn.Module):
+    def __init__(self, embed_dim:int, num_heads:int, dropout:float=0.0):
+        super().__init__()
+        assert embed_dim % num_heads == 0
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.qkv = nn.Linear(embed_dim, 3*embed_dim, bias=False)
+        self.out = nn.Linear(embed_dim, embed_dim)
+        self.drop = nn.Dropout(dropout)
+    def forward(self, x, mask:Optional[torch.Tensor]=None):
+        seq, bsz, _ = x.size()
+        qkv = self.qkv(x).view(seq, bsz, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        q = q.permute(1,2,0,3); k = k.permute(1,2,0,3); v = v.permute(1,2,0,3)
+        scores = torch.matmul(q, k.transpose(-2,-1)) / math.sqrt(self.head_dim)
+        if mask is not None: scores = scores.masked_fill(mask==0, float("-inf"))
+        att = torch.softmax(scores, dim=-1)
+        out = torch.matmul(att, v)
+        out = out.permute(2,0,1,3).contiguous().view(seq, bsz, self.embed_dim)
+        return self.drop(self.out(out))
+
+class TransformerBlock(nn.Module):
+    def __init__(self, embed_dim:int, num_heads:int, ffn_dim:int, dropout=0.1):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn = MultiHeadSelfAttention(embed_dim, num_heads, dropout)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.ff = nn.Sequential(nn.Linear(embed_dim, ffn_dim), nn.GELU(), nn.Linear(ffn_dim, embed_dim))
+        self.drop = nn.Dropout(dropout)
+    def forward(self, x, mask:Optional[torch.Tensor]=None):
+        r = x
+        x = self.norm1(x)
+        x = self.attn(x, mask)
+        x = r + self.drop(x)
+        r = x
+        x = self.norm2(x)
+        x = self.ff(x)
+        return r + self.drop(x)
+
+class ThoughtModule(nn.Module):
+    def __init__(self, embed_dim:int, thought_minutes:float=9.0, token_rate:float=1.0,
+                 n_layers:int=2, n_heads:int=8, max_steps:int=4096):
+        super().__init__()
+        computed = max(8, int(thought_minutes * 60 * token_rate))
+        self.n_steps = min(computed, max_steps)
+        self.start_tokens = nn.Parameter(torch.randn(self.n_steps, 1, embed_dim))
+        self.layers = nn.ModuleList([TransformerBlock(embed_dim, n_heads, embed_dim*2) for _ in range(n_layers)])
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.kv_proj = nn.Linear(embed_dim, embed_dim * 2)
+        self.memory = nn.Parameter(torch.randn(max(16, self.n_steps//4), 1, embed_dim))
+        self.norm = nn.LayerNorm(embed_dim)
+        self.mem_gate = nn.Linear(embed_dim * 2, embed_dim)
+    def cross_attention(self, queries, context):
+        Q, B, E = queries.size()
+        kv = self.kv_proj(context)
+        k, v = kv.chunk(2, dim=-1)
+        q2 = self.q_proj(queries).permute(1,0,2)  # [B,Q,E]
+        k2 = k.permute(1,0,2)  # [B,C,E]
+        scores = torch.matmul(q2, k2.transpose(-2,-1)) / math.sqrt(E)
+        attn = torch.softmax(scores, dim=-1)
+        v2 = v.permute(1,0,2)
+        out = torch.matmul(attn, v2)
+        out = out.permute(1,0,2)
+        return out
+    def forward(self, context: torch.Tensor):
+        seq_len, bsz, embed = context.size()
+        thoughts = self.start_tokens.expand(-1, bsz, -1)
+        mem = self.memory.expand(-1, bsz, -1)
+        full_context = torch.cat([context, mem], dim=0)
+        combined = torch.cat([full_context, thoughts], dim=0)
+        for layer in self.layers:
+            combined = layer(combined)
+        thoughts_out = combined[-self.n_steps:, :, :]
+        cross = self.cross_attention(thoughts_out, full_context)
+        gated = torch.sigmoid(self.mem_gate(torch.cat([thoughts_out, cross], dim=-1))) * cross + thoughts_out
+        return self.norm(gated)
+
+class ONModel(nn.Module):
+    def __init__(self, vocab_size:int, embed_dim:int=DEFAULT_EMBED, num_layers:int=DEFAULT_LAYERS, num_heads:int=DEFAULT_HEADS, max_seq:int=DEFAULT_MAX_SEQ,
+                 thought_minutes:float=9.0, token_rate:float=1.0, thought_max_steps:int=4096, thought_layers:int=2, structure_labels:List[str]=None):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.embed_dim = embed_dim
+        self.max_seq = max_seq
+        self.token_emb = nn.Embedding(vocab_size, embed_dim)
+        self.pos_emb = nn.Parameter(torch.randn(max_seq, 1, embed_dim))
+        self.layers = nn.ModuleList([TransformerBlock(embed_dim, num_heads, embed_dim*4) for _ in range(num_layers)])
+        self.thought = ThoughtModule(embed_dim, thought_minutes=thought_minutes, token_rate=token_rate, n_layers=thought_layers, n_heads=max(8, num_heads//2), max_steps=thought_max_steps)
+        self.final_ln = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, vocab_size)
+        self.vision_adapter = nn.Linear(embed_dim, embed_dim)
+        self.audio_adapter = nn.Linear(embed_dim, embed_dim)
+        self.structure_labels = structure_labels or ["text","code","json","table"]
+        self.structure_head = nn.Linear(embed_dim, len(self.structure_labels))
+    def forward(self, input_ids: torch.LongTensor, vision_emb: Optional[torch.Tensor]=None, audio_emb: Optional[torch.Tensor]=None):
+        bsz, seq = input_ids.size()
+        x = self.token_emb(input_ids).transpose(0,1)
+        x = x + self.pos_emb[:seq,:,:].to(x.device)
+        prefix = []
+        if vision_emb is not None:
+            v = self.vision_adapter(vision_emb).unsqueeze(0)
+            prefix.append(v)
+        if audio_emb is not None:
+            a = self.audio_adapter(audio_emb).unsqueeze(0)
+            prefix.append(a)
+        if prefix:
+            pref = torch.cat(prefix, dim=0)
+            x = torch.cat([pref, x], dim=0)
+        for layer in self.layers:
+            x = layer(x)
+        thought_repr = self.thought(x)
+        x = torch.cat([x, thought_repr], dim=0)
+        x = self.final_ln(x)
+        token_slice = x[-seq:,:,:].transpose(0,1)
+        logits = self.head(token_slice)
+        pooled = token_slice.mean(dim=1)
+        struct_logits = self.structure_head(pooled)
+        return logits, struct_logits
+
+class ConvEncoder(nn.Module):
+    def __init__(self, in_ch=3, z_dim=512):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, 64, 4, 2, 1), nn.ReLU(),
+            nn.Conv2d(64, 128, 4, 2, 1), nn.ReLU(),
+            nn.Conv2d(128, 256, 4, 2, 1), nn.ReLU(),
+            nn.AdaptiveAvgPool2d((4,4)),
+            nn.Flatten(),
+            nn.Linear(256*4*4, z_dim*2)
+        )
+    def forward(self, x):
+        stats = self.net(x)
+        mu, logvar = stats.chunk(2, dim=1)
+        return mu, logvar
+
+class ConvDecoder(nn.Module):
+    def __init__(self, out_ch=3, z_dim=512):
+        super().__init__()
+        self.fc = nn.Linear(z_dim, 256*4*4)
+        self.net = nn.Sequential(
+            nn.Unflatten(1, (256,4,4)),
+            nn.ConvTranspose2d(256, 128, 4, 2, 1), nn.ReLU(),
+            nn.ConvTranspose2d(128, 64, 4, 2, 1), nn.ReLU(),
+            nn.ConvTranspose2d(64, out_ch, 4, 2, 1), nn.Sigmoid()
+        )
+    def forward(self, z):
+        x = self.fc(z)
+        x = self.net(x)
+        return x
+
+class VAE(nn.Module):
+    def __init__(self, img_channels=3, z_dim=512):
+        super().__init__()
+        self.encoder = ConvEncoder(in_ch=img_channels, z_dim=z_dim)
+        self.decoder = ConvDecoder(out_ch=img_channels, z_dim=z_dim)
+    def reparameterize(self, mu, logvar):
+        std = (0.5 * logvar).exp()
+        eps = torch.randn_like(std)
+        return mu + eps * std
+    def encode(self, x):
+        mu, logvar = self.encoder(x)
+        z = self.reparameterize(mu, logvar)
+        return z, mu, logvar
+    def decode(self, z):
+        return self.decoder(z)
+    def forward(self, x):
+        z, mu, logvar = self.encode(x)
+        recon = self.decode(z)
+        return recon, mu, logvar
+
+class SimpleUNet(nn.Module):
+    def __init__(self, latent_dim=512):
+        super().__init__()
+        self.down = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim*2), nn.GELU(),
+            nn.Linear(latent_dim*2, latent_dim)
+        )
+        self.time_embed = nn.Sequential(nn.Linear(1, latent_dim), nn.ReLU())
+        self.out = nn.Sequential(nn.Linear(latent_dim, latent_dim), nn.Tanh())
+    def forward(self, z, t):
+        te = self.time_embed(t.unsqueeze(-1).float())
+        h = self.down(z)
+        h = h + te
+        return self.out(h)
+
+def linear_beta_schedule(timesteps, beta_start=1e-4, beta_end=0.02):
+    return torch.linspace(beta_start, beta_end, timesteps)
+
+class Diffusion:
+    def __init__(self, model: nn.Module, timesteps: int = 1000, device=DEVICE):
+        self.model = model
+        self.timesteps = timesteps
+        self.device = device
+        betas = linear_beta_schedule(timesteps).to(device)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        self.betas = betas
+        self.alphas = alphas
+        self.alphas_cumprod = alphas_cumprod
+        self.sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
+        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1 - alphas_cumprod)
+    def q_sample(self, x_start, t, noise=None):
+        if noise is None:
+            noise = torch.randn_like(x_start)
+        sqrt_acp = self.sqrt_alphas_cumprod[t].unsqueeze(-1)
+        sqrt_om = self.sqrt_one_minus_alphas_cumprod[t].unsqueeze(-1)
+        return sqrt_acp * x_start + sqrt_om * noise
+    def p_losses(self, x_start, t):
+        noise = torch.randn_like(x_start)
+        x_noisy = self.q_sample(x_start, t, noise=noise)
+        t_tensor = t.float() / float(self.timesteps)
+        pred = self.model(x_noisy, t_tensor)
+        return F.mse_loss(pred, noise)
+    @torch.no_grad()
+    def sample(self, shape, device, steps=None):
+        steps = steps or self.timesteps
+        x = torch.randn(shape, device=device)
+        for i in reversed(range(steps)):
+            t = torch.tensor([i], device=device)
+            t_norm = t.float() / float(self.timesteps)
+            pred_noise = self.model(x, t_norm)
+            beta = self.betas[i]
+            alpha = self.alphas[i]
+            alpha_cum = self.alphas_cumprod[i]
+            if i > 0:
+                noise = torch.randn_like(x)
+            else:
+                noise = torch.zeros_like(x)
+            x = (1 / math.sqrt(alpha)) * (x - (beta / math.sqrt(1 - alpha_cum)) * pred_noise) + math.sqrt(beta) * noise
+        return x
+
+image_transform = transforms.Compose([transforms.Resize((224,224)), transforms.ToTensor()])
+
+def collate_texts(tokenizer: ONTokenizerWrapper, texts: List[str], max_len:int=DEFAULT_MAX_SEQ):
+    ids = [tokenizer.encode_ids(t, max_length=max_len) for t in texts]
+    ids = [tokenizer.pad_truncate(i, max_length=max_len) for i in ids]
+    return torch.tensor(ids, dtype=torch.long)
+
+def synthetic_structured_examples():
+    examples = []
+    # few synthetic JSON examples to teach structure
+    examples.append(("{\"title\": \"Servidor\", \"cpu\": 12, \"mem\": 48}", "json"))
+    examples.append(("def hello():\n    print('hello')", "code"))
+    examples.append(("| name | age |\n|----|----|\n| Ana | 30 |", "table"))
+    return examples
+
+def train_real(args):
+    tk = ONTokenizerWrapper(vocab_size=args.vocab_size, path_out=args.tokenizer_path)
+    if os.path.exists(args.tokenizer_path):
+        tk.load()
+    else:
+        def combined_iter():
+            # merge stream of text + code to train tokenizer
+            for ds in args.text_datasets:
+                for s in text_stream_iterator(ds):
+                    yield s
+            for ds in args.code_datasets:
+                for s in code_dataset_iterator(ds):
+                    yield s
+        tk.train_from_iterator(combined_iter())
+
+    text_iters = {ds: text_stream_iterator(ds) for ds in args.text_datasets}
+    code_iters = {ds: code_dataset_iterator(ds) for ds in args.code_datasets}
+    image_iters = {ds: image_dataset_iterator(ds) for ds in args.image_datasets}
+    audio_iters = {ds: audio_dataset_iterator(ds) for ds in args.audio_datasets}
+
+    vocab_size = tk.get_vocab_size()
+    structure_labels = ["text","code","json","table"]
+    model = ONModel(
+        vocab_size=vocab_size,
+        embed_dim=args.embed_dim,
+        num_layers=args.layers,
+        num_heads=args.heads,
+        max_seq=args.max_seq,
+        thought_minutes=args.thought_minutes,
+        token_rate=args.token_rate,
+        thought_max_steps=args.max_thought_steps,
+        thought_layers=args.thought_layers,
+        structure_labels=structure_labels
+    ).to(args.device)
+
+    vision_enc = VisionEncoder(args.embed_dim).to(args.device)
+    audio_enc = ChunkAudioEncoder(args.embed_dim, chunk_seconds=args.audio_chunk_seconds).to(args.device)
+
+    vae = VAE(img_channels=3, z_dim=args.vae_z_dim).to(args.device)
+    unet = SimpleUNet(latent_dim=args.vae_z_dim).to(args.device)
+    diffusion = Diffusion(unet, timesteps=args.diffusion_steps, device=args.device)
+
+    optimizer = torch.optim.AdamW(list(model.parameters()), lr=args.lr)
+    optimizer_vae = torch.optim.AdamW(vae.parameters(), lr=args.lr)
+    optimizer_unet = torch.optim.AdamW(unet.parameters(), lr=args.lr)
+
+    steps = 0
+    synth = synthetic_structured_examples()
+
+    for epoch in range(args.epochs):
+        for ds_name, iterator in text_iters.items():
+            batch_texts = []
+            for i, txt in enumerate(iterator):
+                if not isinstance(txt, str): continue
+                batch_texts.append(txt)
+                if len(batch_texts) == args.batch_size:
+                    input_ids = collate_texts(tk, batch_texts, max_len=args.max_seq).to(args.device)
+
+                    vision_emb = None
+                    audio_emb = None
+
+                    # sample image
+                    for img_ds, img_it in image_iters.items():
+                        try:
+                            img, caption = next(img_it)
+                            if isinstance(img, dict) and "path" in img:
+                                img = Image.open(img["path"]).convert("RGB")
+                            if isinstance(img, Image.Image):
+                                t = image_transform(img).unsqueeze(0).to(args.device)
+                                vision_emb = vision_enc(t)
+                            break
+                        except StopIteration:
+                            continue
+                        except Exception:
+                            continue
+
+                    # sample audio
+                    for a_ds, a_it in audio_iters.items():
+                        try:
+                            aud, meta = next(a_it)
+                            if isinstance(aud, dict) and "array" in aud:
+                                arr = torch.tensor(aud["array"]).float().unsqueeze(0).to(args.device)
+                                audio_emb = audio_enc(arr)
+                            break
+                        except StopIteration:
+                            continue
+                        except Exception:
+                            continue
+
+                    logits, struct_logits = model(input_ids, vision_emb=vision_emb, audio_emb=audio_emb)
+                    labels = input_ids
+                    pad_id = tk.tokenizer.token_to_id("[PAD]") if "[PAD]" in tk.tokenizer.get_vocab() else -100
+                    loss_f = nn.CrossEntropyLoss(ignore_index=pad_id)
+                    lm_loss = loss_f(logits.view(-1, logits.size(-1)), labels.view(-1))
+
+                    # synthetic structure target: default 'text' unless augmentation from code
+                    struct_targets = torch.zeros(logits.size(0), dtype=torch.long, device=args.device)
+                    # small probabilistic augmentation from code datasets
+                    if random.random() < 0.3:
+                        # sample a code snippet to pair
+                        for cds, citer in code_iters.items():
+                            try:
+                                code_sample = next(citer)
+                                if isinstance(code_sample, str):
+                                    # replace first sample with code
+                                    batch_texts[0] = "<CODE_START>\n" + code_sample[:10000] + "\n<CODE_END>"
+                                    input_ids = collate_texts(tk, batch_texts, max_len=args.max_seq).to(args.device)
+                                    logits, struct_logits = model(input_ids, vision_emb=vision_emb, audio_emb=audio_emb)
+                                    struct_targets = torch.zeros(logits.size(0), dtype=torch.long, device=args.device)
+                                    struct_targets[0] = structure_labels.index("code")
+                                break
+                            except StopIteration:
+                                continue
+                            except Exception:
+                                continue
+
+                    # occasionally add JSON/table synthetic labels
+                    if random.random() < 0.05:
+                        k = random.choice(synth)
+                        batch_texts[0] = k[0]
+                        target_label = k[1]
+                        input_ids = collate_texts(tk, batch_texts, max_len=args.max_seq).to(args.device)
+                        logits, struct_logits = model(input_ids, vision_emb=vision_emb, audio_emb=audio_emb)
+                        struct_targets = torch.zeros(logits.size(0), dtype=torch.long, device=args.device)
+                        struct_targets[0] = structure_labels.index(target_label)
+
+                    struct_loss = F.cross_entropy(struct_logits, struct_targets)
+
+                    total_loss = lm_loss + args.structure_loss_weight * struct_loss
+
+                    optimizer.zero_grad()
+                    total_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+
+                    # train VAE + diffusion optional
+                    if vision_emb is not None and args.train_vae_diffusion:
+                        try:
+                            img_tensor = image_transform(img).unsqueeze(0).to(args.device)
+                            recon, mu, logvar = vae(img_tensor)
+                            rec_loss = F.mse_loss(recon, img_tensor) + 1e-6 * torch.mean(torch.exp(logvar) + mu**2 - logvar)
+                            optimizer_vae.zero_grad(); rec_loss.backward(); optimizer_vae.step()
+                            with torch.no_grad():
+                                z, mu_z, logvar_z = vae.encode(img_tensor)
+                            t_idx = torch.randint(0, diffusion.timesteps, (z.shape[0],), device=args.device)
+                            diff_loss = diffusion.p_losses(z, t_idx)
+                            optimizer_unet.zero_grad(); diff_loss.backward(); optimizer_unet.step()
+                        except Exception:
+                            pass
+
+                    steps += 1
+                    if steps % args.log_every == 0:
+                        print(f"epoch {epoch+1} step {steps} loss {total_loss.item():.6f} lm {lm_loss.item():.6f} struct {struct_loss.item():.6f}")
+
+                    batch_texts = []
+                if i > args.max_examples_per_dataset:
+                    break
+
+        ckpt = os.path.join(args.checkpoint_dir, f"on_epoch{epoch+1}.pt")
+        os.makedirs(args.checkpoint_dir, exist_ok=True)
+        torch.save({
+            "model": model.state_dict(),
+            "optim": optimizer.state_dict(),
+            "vae": vae.state_dict(),
+            "opt_vae": optimizer_vae.state_dict(),
+            "unet": unet.state_dict(),
+            "opt_unet": optimizer_unet.state_dict(),
+            "tokenizer": tk.tokenizer.to_str()
+        }, ckpt)
+        print(f"[TRAIN] checkpoint salvo: {ckpt}")
+
+    print("[TRAIN] finalizado")
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--vocab_size", type=int, default=50000)
+    p.add_argument("--max_seq", type=int, default=DEFAULT_MAX_SEQ)
+    p.add_argument("--embed_dim", type=int, default=DEFAULT_EMBED)
+    p.add_argument("--layers", type=int, default=DEFAULT_LAYERS)
+    p.add_argument("--heads", type=int, default=DEFAULT_HEADS)
+    p.add_argument("--batch_size", type=int, default=DEFAULT_BATCH)
+    p.add_argument("--epochs", type=int, default=1)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--device", type=str, default=str(DEVICE))
+    p.add_argument("--tokenizer_path", type=str, default="on_tokenizer.json")
+    p.add_argument("--checkpoint_dir", type=str, default=CHECKPOINT_DIR)
+    p.add_argument("--log_every", type=int, default=10)
+    p.add_argument("--max_examples_per_dataset", type=int, default=200)
+    p.add_argument("--text_datasets", nargs="+", default=DATASET_IDS_TEXT)
+    p.add_argument("--image_datasets", nargs="+", default=DATASET_IDS_IMAGE)
+    p.add_argument("--audio_datasets", nargs="+", default=DATASET_IDS_AUDIO)
+    p.add_argument("--code_datasets", nargs="+", default=DATASET_IDS_CODE)
+    p.add_argument("--audio_chunk_seconds", type=float, default=30.0)
+    p.add_argument("--vae_z_dim", type=int, default=512)
+    p.add_argument("--diffusion_steps", type=int, default=200)
+    p.add_argument("--train_vae_diffusion", action="store_true")
+    p.add_argument("--thought_minutes", type=float, default=9.0)
+    p.add_argument("--token_rate", type=float, default=1.0)
+    p.add_argument("--max_thought_steps", type=int, default=4096)
+    p.add_argument("--thought_layers", type=int, default=2)
+    p.add_argument("--structure_loss_weight", type=float, default=1.0)
+    p.add_argument("--tokenizer_vocab_estimate", type=int, default=50000)
+    return p.parse_args()
+
+if __name__ == "__main__":
+    args = parse_args()
+    args.device = torch.device(args.device)
+    train_real(args)
