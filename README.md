@@ -107,27 +107,3 @@ Ferramentas de análise e resumo de grandes volumes de dados multimodais.
 Plataformas de educação, pesquisa e robótica com percepção multimodal.
 
 
-
-
-
----
-
-Resumo Técnico:
-
-Parâmetro	Valor
-
-Modelo base	Transformer multimodal
-Parâmetros	~7B (estimativa, versão “mini”)
-Embedding	1024-d
-Camadas	12
-Cabeças de atenção	16
-Contexto máximo	200.000 tokens
-Tipos de entrada	Texto, código, áudio, imagem
-Saídas estruturadas	text, code, json, table
-Memória de longo prazo	Thought Module (até 9 minutos de tokens)
-VAE + Diffusion	Sim, para imagens
-Tokenizer	BPE, até 200k tokens, tokens especiais multimodais
-Linguagens de programação	Python, JS, C++, C, HTML, CSS
-Treinamento	Datasets multimodais (text, code, audio, image)
-
-
